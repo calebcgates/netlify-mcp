@@ -14,7 +14,7 @@
 //  [x] user-and-team
 //    [x] user
 //    [x] team
-//    [] team env vars
+//    [x] team env vars
 //  [] sites aggregate operations
 //  [x] extensions - install and link - not configuration
 //  [] database
@@ -29,9 +29,10 @@ import { teamDomainTools } from './team-tools/index.js';
 import { projectDomainTools } from './project-tools/index.js';
 import { extensionDomainTools } from './extension-tools/index.js';
 import { checkCompatibility } from '../utils/compatibility.js';
-import { getNetlifyAccessToken, NetlifyUnauthError } from '../utils/api-networking.js';
+import { getNetlifyAccessToken, NetlifyUnauthError, NetlifyApiError } from '../utils/api-networking.js';
 import { appendToLog } from '../utils/logging.js';
-import { categorizeToolsByReadWrite } from './tool-utils.js';
+import { log } from '../../netlify/functions/mcp-server/logger.js';
+import { aggregateToolAnnotations, categorizeToolsByReadWrite, completeToolAnnotations } from './tool-utils.js';
 import { z } from 'zod';
 import type { DomainTool } from './types.js';
 
@@ -94,8 +95,11 @@ const registerDomainTools = (
   if (verboseMode) {
     // Register each tool individually (no anyOf/union)
     tools.forEach(tool => {
-      const toolName = `netlify-${domain}-${tool.operation}`;
-      const toolDescription = `${tool.operation} operation for Netlify ${domain}${readOnlyIndicator}`;
+      const toolName = tool.granularToolName ?? `netlify-${domain}-${tool.operation}`;
+      // Prefer the operation's own description. The generated fallback only
+      // restates the tool name, which is not enough on its own.
+      const toolDescription = tool.description
+        ?? `${tool.operation} operation for Netlify ${domain}${readOnlyIndicator}`;
 
       // The MCP SDK expects inputSchema to be a plain object with Zod schemas as properties
       // We need to extract the shape from the Zod object and use it directly
@@ -104,9 +108,9 @@ const registerDomainTools = (
       server.registerTool(toolName, {
         description: toolDescription,
         inputSchema: schemaShape,
-        annotations: {
-          readOnlyHint: operationType === 'read'
-        }
+        // Verbose mode registers each operation separately, so each gets its
+        // own precise hints rather than the domain-wide aggregate.
+        annotations: completeToolAnnotations(tool.toolAnnotations),
       }, async (...args: any[]) => {
         checkCompatibility();
 
@@ -125,7 +129,28 @@ const registerDomainTools = (
 
         appendToLog(`${toolName} operation: ${JSON.stringify(args)}`);
 
-        const result = await tool.cb(args[0], {request: remoteMCPRequest, isRemoteMCP: !!remoteMCPRequest});
+        let result;
+        try {
+          result = await tool.cb(args[0], {request: remoteMCPRequest, isRemoteMCP: !!remoteMCPRequest});
+        } catch (err) {
+          // A mid-operation 401 (NetlifyUnauthError) is a re-auth signal handled
+          // upstream as an OAuth challenge — not a failure. An API 4xx (not-found,
+          // validation) is an expected client outcome, so log it at warn; only
+          // genuine 5xx/unexpected failures are logged at error. Rethrow either way
+          // so the client still gets its error result.
+          if (err instanceof NetlifyUnauthError) throw err;
+          if (err instanceof NetlifyApiError && err.status < 500) {
+            // `operation` must match what the call line in mcp.ts recorded, or
+            // failures land on a different dimension from the calls they came
+            // from. In granular mode there is no selectSchema, so that line
+            // falls back to the full tool name — use it here too, and keep the
+            // short name separately for comparing an operation across surfaces.
+            log.warn('tool operation client error', { domain, operation: toolName, domainOperation: tool.operation, toolName, status: err.status });
+          } else {
+            log.error('tool operation failed', { domain, operation: toolName, domainOperation: tool.operation, toolName, err });
+          }
+          throw err;
+        }
 
         appendToLog(`${domain} operation result: ${JSON.stringify(result)}`);
 
@@ -148,9 +173,9 @@ const registerDomainTools = (
     server.registerTool(toolName, {
       description: toolDescription,
       inputSchema: paramsSchema,
-      annotations: {
-        readOnlyHint: operationType === 'read'
-      }
+      // One tool fronting many operations, so the hints describe the worst case
+      // of what the selector can actually be asked to do.
+      annotations: aggregateToolAnnotations(tools),
     }, async (...args: any[]) => {
       checkCompatibility();
 
@@ -187,7 +212,23 @@ const registerDomainTools = (
         }
       }
 
-      const result = await subtool.cb(selectedSchema.params || {}, {request: remoteMCPRequest, isRemoteMCP: !!remoteMCPRequest});
+      let result;
+      try {
+        result = await subtool.cb(selectedSchema.params || {}, {request: remoteMCPRequest, isRemoteMCP: !!remoteMCPRequest});
+      } catch (err) {
+        // A mid-operation 401 (NetlifyUnauthError) is a re-auth signal handled
+        // upstream as an OAuth challenge — not a failure. An API 4xx (not-found,
+        // validation) is an expected client outcome, so log it at warn; only
+        // genuine 5xx/unexpected failures are logged at error. Rethrow either way
+        // so the client still gets its error result.
+        if (err instanceof NetlifyUnauthError) throw err;
+        if (err instanceof NetlifyApiError && err.status < 500) {
+          log.warn('tool operation client error', { domain, operation, toolName, status: err.status });
+        } else {
+          log.error('tool operation failed', { domain, operation, toolName, err });
+        }
+        throw err;
+      }
 
       appendToLog(`${domain} operation result: ${JSON.stringify(result)}`);
 

@@ -11,6 +11,7 @@ import { randomUUID } from "crypto";
 import { rm } from "fs/promises";
 import { authenticatedFetch, getNetlifyAccessToken, getSiteId, unauthenticatedFetch } from "../../utils/api-networking.ts";
 import { createJWE, getOAuthIssuer } from '../../../netlify/functions/mcp-server/utils.ts';
+import { TOKEN_TYPE } from '../../../netlify/functions/mcp-server/token-types.ts';
 
 const deploySiteRemotelyParamsSchema = z.object({
   siteId: z.string().optional().describe(`provide the site id of the site of this site. If the agent cannot find the siteId, the user must confirm this is a new site. NEVER assume the user wants a new site. Use 'netlify link' CLI command to link to an existing site and get a site id.`)
@@ -19,14 +20,23 @@ const deploySiteRemotelyParamsSchema = z.object({
 export const deploySiteRemotelyDomainTool: DomainTool<typeof deploySiteRemotelyParamsSchema> = {
   domain: 'deploy',
   operation: 'deploy-site',
+  granularToolName: 'netlify-deploy-site',
+  description:
+    "Deploy a project to an existing Netlify site and publish it, making it what visitors see. Returns a command for the user to run in their project directory. siteId is required in practice — this cannot create a new site, and omitting it produces a command that will not work. Use get-projects or create-new-project first if the target site id is not known.",
   inputSchema: deploySiteRemotelyParamsSchema,
   omitFromLocalMCP: true,
   toolAnnotations: {
     readOnlyHint: false,
-  },
+    // Publishing adds a new deploy and makes it live. The previous deploy is
+    // retained and can be restored, so nothing is destroyed — but each call
+    // produces another deploy rather than converging, hence not idempotent.
+    destructiveHint: false,
+    idempotentHint: false,
+},
   cb: async (params, {request}) => {
 
     const proxyToken = await createJWE({
+      typ: TOKEN_TYPE.proxy,
       accessToken: await getNetlifyAccessToken(request),
       siteId: params.siteId,
       // TODO: in the future, lock this down even further

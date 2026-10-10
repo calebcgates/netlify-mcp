@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  classifyUnresolvedClientId,
   createStatelessClientId,
   inferApplicationType,
   isRedirectUriAllowed,
@@ -9,8 +10,10 @@ import {
 } from './client-registry.ts';
 import { staticClients } from './oauth-clients.ts';
 
-// These tests run against the localhost dev key (no OAUTH_ISSUER / JWE_SECRET
-// set), which is exactly the stateless round-trip we depend on in production.
+// Pin the dev-key path regardless of ambient env: a localhost issuer with no
+// JWE_SECRET makes createJWE/decryptJWE use the fixed dev-only key.
+process.env.OAUTH_ISSUER = 'http://localhost:8888';
+delete process.env.JWE_SECRET;
 
 test('inferApplicationType: loopback and custom-scheme redirects are native', () => {
   assert.equal(inferApplicationType(['http://localhost:8080/cb']), 'native');
@@ -28,7 +31,7 @@ test('inferApplicationType: a set of purely remote origins is web', () => {
 
 test('inferApplicationType: any native redirect makes the whole client native', () => {
   // Looser than exact spec text, but avoids ever storing web + a native
-  // redirect, which oidc-provider rejects.
+  // redirect (a `web` client must use only https web URIs).
   assert.equal(inferApplicationType(['http://localhost/cb', 'https://app.example.com/cb']), 'native');
   assert.equal(inferApplicationType(['cursor://cb', 'https://app.example.com/cb']), 'native');
 });
@@ -109,6 +112,34 @@ test('resolveClient returns unknown for a legacy opaque client_id', async () => 
 test('resolveClient returns unknown for empty/missing ids', async () => {
   assert.equal((await resolveClient(undefined)).source, 'unknown');
   assert.equal((await resolveClient('')).source, 'unknown');
+});
+
+test('classifyUnresolvedClientId: empty for no client_id', () => {
+  assert.equal(classifyUnresolvedClientId(undefined), 'empty');
+  assert.equal(classifyUnresolvedClientId(null), 'empty');
+  assert.equal(classifyUnresolvedClientId(''), 'empty');
+});
+
+test('classifyUnresolvedClientId: opaque for legacy/static-shaped ids (no dots)', () => {
+  assert.equal(classifyUnresolvedClientId('legacy-opaque-random-id-1234567890'), 'opaque');
+  // Same shape (base64url, no dots) as a real pre-provisioned static client_id.
+  assert.equal(classifyUnresolvedClientId(staticClients[0].client_id), 'opaque');
+});
+
+test('classifyUnresolvedClientId: jwe-like for a real (if undecryptable) stateless client_id shape', async () => {
+  const clientId = await createStatelessClientId({
+    redirect_uris: ['https://client.example.com/callback'],
+    grant_types: ['authorization_code'],
+    response_types: ['code'],
+    token_endpoint_auth_method: 'none',
+    application_type: 'web',
+  });
+  // Compact JWE: 5 dot-separated segments, i.e. 4 dots — true regardless of
+  // whether it still decrypts under the current JWE_SECRET.
+  assert.equal(classifyUnresolvedClientId(clientId), 'jwe-like');
+  // A string with the wrong dot-count (e.g. a JWT-shaped 2-dot id someone hand-crafted)
+  // is not mistaken for our JWE shape.
+  assert.equal(classifyUnresolvedClientId('a.b.c'), 'opaque');
 });
 
 test('resolveClient recognizes a pre-provisioned static client', async () => {

@@ -3,7 +3,9 @@ import * as fs from 'node:fs/promises';
 import envPaths from 'env-paths';
 import { runCommand } from './cmd.ts';
 import { appendToLog } from './logging.ts';
+import { loginSpawnEnv } from './login-attribution.ts';
 import { decryptJWE } from '../../netlify/functions/mcp-server/utils.ts';
+import { isTokenTypeAllowed, TOKEN_TYPE } from '../../netlify/functions/mcp-server/token-types.ts';
 import { log } from '../../netlify/functions/mcp-server/logger.ts';
 import { flagAuthChallenge } from '../../netlify/functions/mcp-server/request-signals.ts';
 import type { TokenIdentity } from '../../netlify/functions/mcp-server/identity.js';
@@ -14,6 +16,10 @@ interface APIInteractionOptions {
   pageLimit?: number;
   pageOffset?: number;
   failureCallback?: (response: Response) => string | void;
+  // Statuses the caller is about to silently retry (e.g. a 422 name conflict)
+  // and so doesn't want logged as a failure — anything not listed here still
+  // logs as usual. Only honored on the non-paginated path.
+  quietStatuses?: number[];
 }
 
 const getAuthTokenMsg = `
@@ -26,6 +32,19 @@ export class NetlifyUnauthError extends Error {
   constructor(message?: string) {
     super(`${UNAUTHED_ERROR_PREFIX} ${message || 'unauthenticated request to Netlify MCP API'}`);
     this.name = 'NetlifyUnauthError';
+  }
+}
+
+// Thrown when the Netlify API returns a non-OK status. Carries the status so
+// callers can tell an expected client outcome (4xx: not-found, validation) apart
+// from a genuine server/network failure (5xx), and log at the right severity.
+// The message is unchanged (`Failed to fetch API: <status>`) for compatibility.
+export class NetlifyApiError extends Error {
+  readonly status: number;
+  constructor(status: number) {
+    super(`Failed to fetch API: ${status}`);
+    this.name = 'NetlifyApiError';
+    this.status = status;
   }
 }
 
@@ -90,6 +109,11 @@ export const getTokenIdentity = async (request?: Request): Promise<TokenIdentity
   }
 };
 
+// The CLI opens the browser and then polls for the ticket for up to five
+// minutes, so this must outlast that poll or the CLI is killed before it
+// writes the token.
+const LOGIN_TIMEOUT_MS = 6 * 60 * 1000;
+
 export const getNetlifyAccessToken = async (request?: Request): Promise<string> => {
 
   if (request) {
@@ -105,6 +129,11 @@ export const getNetlifyAccessToken = async (request?: Request): Promise<string> 
           decrypted = await decryptJWE(bearerToken);
         } catch {
           throw new NetlifyUnauthError('Bearer token is invalid or expired');
+        }
+        // Codes, refresh tokens and proxy tokens also carry an accessToken; only
+        // access tokens are bearers here (see token-types.ts).
+        if (!isTokenTypeAllowed(decrypted, [TOKEN_TYPE.access])) {
+          throw new NetlifyUnauthError('Bearer token is not an access token');
         }
         if(decrypted && typeof decrypted.accessToken === 'string') {
           token = decrypted.accessToken;
@@ -132,7 +161,7 @@ export const getNetlifyAccessToken = async (request?: Request): Promise<string> 
 
   if (!token) {
 
-    const result = await runCommand('netlify login', { env: process.env });
+    const result = await runCommand('netlify login', { env: loginSpawnEnv(), timeout: LOGIN_TIMEOUT_MS });
 
     appendToLog(["Netlify login exit code and output", JSON.stringify(result)]);
 
@@ -160,7 +189,7 @@ export const unauthenticatedFetch = async (url: string, options: RequestInit = {
 }
 
 
-export const authenticatedFetch = async (urlOrPath: string, options: RequestInit = {}, incomingRequest?: Request) => {
+export const authenticatedFetch = async (urlOrPath: string, options: RequestInit = {}, incomingRequest?: Request, quietStatuses?: number[]) => {
   const token = await getNetlifyAccessToken(incomingRequest);
   const url = new URL(urlOrPath, 'https://api.netlify.com')
   const method = (options.method || 'GET').toString().toUpperCase();
@@ -190,6 +219,8 @@ export const authenticatedFetch = async (urlOrPath: string, options: RequestInit
         if (incomingRequest) {
           flagAuthChallenge('The Netlify access token is no longer valid');
         }
+      } else if (quietStatuses?.includes(response.status)) {
+        log.debug('netlify api call failed (expected, caller is handling it)', { method, apiPath: url.pathname, status: response.status });
       } else {
         log.warn('netlify api call failed', { method, apiPath: url.pathname, status: response.status });
       }
@@ -203,10 +234,23 @@ export const authenticatedFetch = async (urlOrPath: string, options: RequestInit
 }
 
 
-export const getAPIJSONResult = async (urlOrPath: string, options: RequestInit = {}, apiInteractionOptions: APIInteractionOptions = {}, incomingRequest?: Request): Promise<any> => {
+/**
+ * Fetches a Netlify API endpoint and deserializes the JSON body.
+ *
+ * The type parameter is required: callers must name the canonical response type
+ * for the endpoint they are calling (see `./api-types.ts`), so responses arrive
+ * typed rather than as `any`. `T` describes the deserialized body — the casts
+ * below are the deserialization boundary itself, where an untyped `JSON.parse`
+ * result is given the shape the caller declared.
+ *
+ * Note that a `failureCallback` which returns instead of throwing, and a
+ * non-JSON or empty body, both yield a `string` at runtime. Call sites relying
+ * on that should include `string` in `T` and narrow.
+ */
+export const getAPIJSONResult = async <T>(urlOrPath: string, options: RequestInit = {}, apiInteractionOptions: APIInteractionOptions = {}, incomingRequest?: Request): Promise<T> => {
 
   if(!apiInteractionOptions.pagination){
-    const response = await authenticatedFetch(urlOrPath, options, incomingRequest);
+    const response = await authenticatedFetch(urlOrPath, options, incomingRequest, apiInteractionOptions.quietStatuses);
 
     if(response.status === 401 && incomingRequest) {
       throw new NetlifyUnauthError(`Unauthedenticated request to Netlify API. ${urlOrPath}`);
@@ -214,30 +258,38 @@ export const getAPIJSONResult = async (urlOrPath: string, options: RequestInit =
 
     if (!response.ok) {
       if(apiInteractionOptions.failureCallback){
-        return apiInteractionOptions.failureCallback(response);
+        return apiInteractionOptions.failureCallback(response) as T;
       }
-      throw new Error(`Failed to fetch API: ${response.status}`);
+      throw new NetlifyApiError(response.status);
     }
 
-    const data = await response.text();
+    // Reading the body can reject if the connection drops mid-download
+    // (UND_ERR_BODY_TIMEOUT / UND_ERR_SOCKET / UND_ERR_ABORTED). Surface a
+    // clear message instead of leaking the raw undici error.
+    let data: string;
+    try {
+      data = await response.text();
+    } catch (err) {
+      throw new Error(`Failed to read Netlify API response body: ${err instanceof Error ? err.message : String(err)}`);
+    }
     if (!data) {
-      return '';
+      return '' as T;
     }
 
     try{
-      return JSON.parse(data);
+      return JSON.parse(data) as T;
     } catch (e) {
       if (apiInteractionOptions.failureCallback) {
-        return apiInteractionOptions.failureCallback(response);
+        return apiInteractionOptions.failureCallback(response) as T;
       }
-      return data;
+      return data as T;
     }
   }
 
   const currentTime = Date.now();
   const maxDuration = 22000; // 22 seconds
 
-  let apiResults = [];
+  let apiResults: unknown[] = [];
   let page = 1 + (apiInteractionOptions.pageOffset || 0);
 
   // avoid unbounded requests
@@ -254,22 +306,27 @@ export const getAPIJSONResult = async (urlOrPath: string, options: RequestInit =
 
     if (!response.ok) {
       if (apiInteractionOptions.failureCallback) {
-        return apiInteractionOptions.failureCallback(response);
+        return apiInteractionOptions.failureCallback(response) as T;
       }
-      throw new Error(`Failed to fetch API: ${response.status}`);
+      throw new NetlifyApiError(response.status);
     }
 
-    const resultRaw = await response.text();
+    let resultRaw: string;
+    try {
+      resultRaw = await response.text();
+    } catch (err) {
+      throw new Error(`Failed to read Netlify API response body: ${err instanceof Error ? err.message : String(err)}`);
+    }
 
     if (!resultRaw) {
       break;
     }
 
-    const result = JSON.parse(resultRaw);
+    const result: unknown = JSON.parse(resultRaw);
 
     const lastResultTime = Date.now();
     const duration = (lastResultTime - currentTime) / 1000;
-    appendToLog(`Fetched page ${page}, received ${result.length} sites, total ${apiResults.length}, duration: ${duration} seconds`);
+    appendToLog(`Fetched page ${page}, received ${Array.isArray(result) ? result.length : 0} sites, total ${apiResults.length}, duration: ${duration} seconds`);
 
     if (Array.isArray(result)) {
 
@@ -288,7 +345,7 @@ export const getAPIJSONResult = async (urlOrPath: string, options: RequestInit =
     }
   }
 
-  return apiResults;
+  return apiResults as T;
 }
 
 export type NetlifySite = {

@@ -1,20 +1,23 @@
-import { HandlerResponse } from "@netlify/functions";
+import type { HandlerResponse } from "@netlify/functions";
 import { createHash } from "crypto";
 import { createJWE, decryptJWE, getOAuthIssuer } from "./utils.ts";
 import { maskToken } from "./logging.ts";
-import { log } from "./logger.ts";
+import { log, truncateForLog } from "./logger.ts";
 import { resolveIdentity, type TokenIdentity } from "./identity.ts";
 import {
+  classifyUnresolvedClientId,
   createStatelessClientId,
   inferApplicationType,
   isRedirectUriAllowed,
   resolveClient,
   type RegisteredClient,
 } from "./client-registry.ts";
-
-// Grant types this Authorization Server issues. Registration requests are
-// intersected with this set so a client can't register for a flow we don't run.
-const SUPPORTED_GRANT_TYPES = ['authorization_code', 'refresh_token'] as const;
+import { attributionParams } from "./agent-attribution.ts";
+// Grant types this Authorization Server issues, shared with the discovery
+// metadata so registration validation and what we advertise can't drift apart.
+import { SUPPORTED_GRANT_TYPES } from "./oauth-config.ts";
+import { signInitState, verifyInitState, type AUTH_REQUEST_STATE } from "./init-state.ts";
+import { isTokenTypeAllowed, TOKEN_TYPE } from "./token-types.ts";
 
 /**
  * When true, any request whose redirect_uri we can't match to a registration is
@@ -34,15 +37,18 @@ function rejectUnknownClients(): boolean {
 /** Host of a redirect_uri for logging, without leaking the full URI. */
 function redirectHostForLog(redirectUri: string): string {
   try {
-    return new URL(redirectUri).host || 'unknown';
+    return truncateForLog(new URL(redirectUri).host) || 'unknown';
   } catch {
     return 'unparseable';
   }
 }
 
 /**
- * Redirect_uri validation gate. Returns an OAuth error response when the
- * request must be rejected, or null when it may proceed.
+ * Redirect_uri validation gate. `error` is an OAuth error response when the
+ * request must be rejected, or null when it may proceed. `client` is the
+ * client resolved for this client_id (null when unresolved), handed back so a
+ * caller that needs it (e.g. for its `client_name`) doesn't have to resolve
+ * it again.
  *
  * Log-only by default: a request that matches a registration proceeds quietly;
  * anything else (a stateless/static client whose redirect doesn't match, or an
@@ -54,45 +60,45 @@ async function validateClientRedirect(
   clientId: string,
   redirectUri: string,
   op: string,
-): Promise<HandlerResponse | null> {
+): Promise<{ error: HandlerResponse | null; client: RegisteredClient | null }> {
   const { client, source } = await resolveClient(clientId);
 
   if (client && isRedirectUriAllowed(client, redirectUri)) {
     log.debug(`${op}: redirect_uri validated`, { client_id: clientId, source });
-    return null;
+    return { error: null, client };
   }
 
   if (rejectUnknownClients()) {
     const [error, description] = client
       ? ['invalid_request', 'redirect_uri does not match a registered redirect URI for this client']
       : ['invalid_client', 'Unregistered client_id or redirect_uri'];
-    return oauthError(400, error, description, op, { client_id: clientId, source, redirect_uri: redirectUri });
+    return { error: oauthError(400, error, description, op, { client_id: clientId, source, redirect_uri: redirectUri }), client };
   }
 
   // Log-only mode: surface unconditionally (not log.debug) so operators can see
   // this traffic in steady state and decide when it's safe to enforce.
+  //
+  // `reason` distinguishes WHY it wasn't validated, since `source: unknown` alone
+  // conflates several different situations that call for different fixes:
+  //  - 'redirect_mismatch': the client resolved fine (static or stateless) but
+  //    this redirect_uri isn't one it registered — the most attack-relevant case.
+  //  - 'jwe-like' / 'opaque' / 'empty': the client_id itself couldn't be
+  //    resolved at all — see classifyUnresolvedClientId for what each implies.
   log.warn('[oauth] redirect_uri not validated (allowed; set DCR_REJECT_UNKNOWN_CLIENTS=true to enforce)', {
     op,
     source,
+    reason: client ? 'redirect_mismatch' : classifyUnresolvedClientId(clientId),
     client_id: maskToken(clientId),
     redirect_host: redirectHostForLog(redirectUri),
   });
-  return null;
+  return { error: null, client };
 }
 
 
-interface AUTH_REQUEST_STATE {
-  response_type: 'code';
-  client_id: string;
-  redirect_uri: string;
-  code_challenge: string;
-  code_challenge_method: 'S256';
-  state?: string;
-  scope?: string;
-  nonce?: string;
-}
-
+// `typ` is optional on the payloads we read back: tokens issued before typing
+// have none (see token-types.ts). Every token minted here sets it.
 interface CODE_JWE_PAYLOAD {
+  typ?: typeof TOKEN_TYPE.code;
   state: Partial<AUTH_REQUEST_STATE>;
   accessToken: string;
   // Resolved once at server-redirect and carried through so it can be attached
@@ -102,12 +108,16 @@ interface CODE_JWE_PAYLOAD {
 }
 
 interface ACCESS_TOKEN_PAYLOAD {
+  typ?: typeof TOKEN_TYPE.access;
   accessToken: string;
   identity?: TokenIdentity;
 }
 
 interface REFRESH_TOKEN_PAYLOAD {
+  typ?: typeof TOKEN_TYPE.refresh;
   accessToken: string;
+  // The pre-typing marker, still written so a rollback keeps accepting
+  // refresh tokens issued after this change.
   type: 'refresh';
   identity?: TokenIdentity;
 }
@@ -210,7 +220,7 @@ export async function handleAuthStart(req: Request): Promise<HandlerResponse>{
   // the round-tripped state. This is the primary defense against an open redirect:
   // an unregistered redirect_uri never makes it into the authorization code, so
   // handleServerSideAuthRedirect can only ever 302 to a URI the client registered.
-  const redirectError = await validateClientRedirect(clientId, redirectUri, 'authorize');
+  const { error: redirectError, client } = await validateClientRedirect(clientId, redirectUri, 'authorize');
   if (redirectError) {
     return redirectError;
   }
@@ -230,14 +240,15 @@ export async function handleAuthStart(req: Request): Promise<HandlerResponse>{
     }
   }
 
-  // b64 value for the redirects
-  const paramsState = Buffer.from(JSON.stringify(paramsObj), 'utf-8').toString('base64');
+  // Signed so server-redirect can trust it and Netlify's consent screen can show
+  // where the code will go (see init-state.ts). A compact JWS is URL-safe.
+  const paramsState = await signInitState(paramsObj);
   const netlifyRedirectUri = `${parsedUrl.origin}/oauth-server/client-redirect`;
 
   return {
     statusCode: 302,
     headers: {
-      'Location': `https://app.netlify.com/authorize?client_id=${NTL_AUTH_CLIENT_ID}&response_type=token&state=${paramsState}&redirect_uri=${netlifyRedirectUri}`
+      'Location': `https://app.netlify.com/authorize?client_id=${NTL_AUTH_CLIENT_ID}&response_type=token&state=${paramsState}&redirect_uri=${netlifyRedirectUri}&utm_source=mcp&utm_campaign=integrations${attributionParams(client?.client_name)}`
     },
     body: ''
   };
@@ -287,7 +298,7 @@ export async function handleClientSideAuthExchange(){
       hashToken = hash;
     }
 
-    window.location.href = '/oauth-server/server-redirect?token=' + hashToken + '&init-state=' + hashState;
+    window.location.href = '/oauth-server/server-redirect?token=' + encodeURIComponent(hashToken) + '&init-state=' + encodeURIComponent(hashState);
   </script>
 </body>
 </html>
@@ -305,9 +316,20 @@ export async function handleServerSideAuthRedirect(req: Request): Promise<Handle
     return oauthError(400, 'invalid_request', `Missing required parameters: ${!initState ? 'init-state' : ''} ${!token ? 'token' : ''}`.trim(), 'server-redirect', { hasInitState: !!initState, hasToken: !!token });
   }
 
+  // Only a state we signed at /authorize is accepted. An unsigned or edited one
+  // would let a crafted link skip /authorize and choose where the code goes,
+  // without that destination ever being shown on Netlify's consent screen.
+  let stateObj: Partial<AUTH_REQUEST_STATE>;
   try {
-    const stateObj = JSON.parse(Buffer.from(initState, 'base64').toString('utf-8')) as Partial<AUTH_REQUEST_STATE>;
+    stateObj = await verifyInitState(initState);
+  } catch (error) {
+    return oauthError(400, 'invalid_request', 'Invalid or expired init-state parameter', 'server-redirect', {
+      reason: 'init-state verification failed',
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
 
+  try {
     const requiredStateParams: Array<keyof AUTH_REQUEST_STATE> = [
       'client_id',
       'redirect_uri',
@@ -349,9 +371,9 @@ export async function handleServerSideAuthRedirect(req: Request): Promise<Handle
       ...(stateObj.nonce ? { nonce: stateObj.nonce } : {}),
     };
 
-    // Defense in depth: init-state round-trips through the browser, so re-check
-    // the redirect_uri against the client's registration before we 302 to it.
-    const redirectError = await validateClientRedirect(validatedState.client_id, validatedState.redirect_uri, 'server-redirect');
+    // Defense in depth: re-check the redirect_uri against the client's
+    // registration before we 302 to it, even though we signed it ourselves.
+    const { error: redirectError } = await validateClientRedirect(validatedState.client_id, validatedState.redirect_uri, 'server-redirect');
     if (redirectError) {
       return redirectError;
     }
@@ -372,9 +394,9 @@ export async function handleServerSideAuthRedirect(req: Request): Promise<Handle
 
     // TODO: future, we will add specific tools and other context to this for
     // downstream validation
-    log.info('server redirect: issuing authorization code', { client_id: validatedState.client_id, redirect_uri: validatedState.redirect_uri, scope: validatedState.scope, hasIdentity: !!identity });
+    log.info('server redirect: issuing authorization code', { client_id: maskToken(validatedState.client_id), redirect_host: redirectHostForLog(validatedState.redirect_uri), scope: truncateForLog(validatedState.scope), hasIdentity: !!identity });
 
-    const jwe = await createJWE({ state: validatedState, accessToken: token, ...(identity ? { identity } : {}) } satisfies CODE_JWE_PAYLOAD);
+    const jwe = await createJWE({ typ: TOKEN_TYPE.code, state: validatedState, accessToken: token, ...(identity ? { identity } : {}) } satisfies CODE_JWE_PAYLOAD);
 
     rediredctURL.searchParams.set('code', jwe);
 
@@ -387,7 +409,7 @@ export async function handleServerSideAuthRedirect(req: Request): Promise<Handle
     };
   
   } catch (error) {
-    return oauthError(400, 'invalid_request', 'Invalid init-state parameter', 'server-redirect', { reason: 'init-state parse failed', detail: error instanceof Error ? error.message : String(error) });
+    return oauthError(400, 'invalid_request', 'Invalid init-state parameter', 'server-redirect', { reason: 'init-state invalid', detail: error instanceof Error ? error.message : String(error) });
   }
 }
 
@@ -419,7 +441,7 @@ export async function handleClientRegistration(req: Request, supportedScopes: st
   // Intersect requested grant types with what we support; default to
   // authorization_code when the client sends none.
   const requestedGrantTypes: string[] = Array.isArray(body.grant_types) ? body.grant_types : ['authorization_code'];
-  const grantTypes = requestedGrantTypes.filter((g) => (SUPPORTED_GRANT_TYPES as readonly string[]).includes(g));
+  const grantTypes = requestedGrantTypes.filter((g) => SUPPORTED_GRANT_TYPES.includes(g));
   const effectiveGrantTypes = grantTypes.length > 0 ? grantTypes : ['authorization_code'];
 
   // redirect_uris are required for the authorization_code flow (the only flow
@@ -438,9 +460,8 @@ export async function handleClientRegistration(req: Request, supportedScopes: st
 
   // Always infer rather than trust a client-supplied value: a client that
   // mislabels a custom-scheme or loopback redirect as `web` would otherwise be
-  // stored as an invalid `web` + non-web-redirect combination that
-  // oidc-provider's client validation rejects if the client ever hits an
-  // oidc-handled endpoint (e.g. revocation).
+  // stored as the invalid combination `web` + non-web redirect (a `web` client
+  // must use only https web URIs).
   const applicationType = inferApplicationType(redirectUris);
 
   const client: Omit<RegisteredClient, 'client_id'> = {
@@ -456,7 +477,18 @@ export async function handleClientRegistration(req: Request, supportedScopes: st
 
   const clientId = await createStatelessClientId(client);
 
-  log.debug('register: issued stateless client_id', { redirect_uris: redirectUris, application_type: applicationType, scope });
+  // client_name, redirect_uris, and scope are client-asserted: nothing verifies
+  // client_name, and a registration can send arbitrarily many/long redirect_uris.
+  // The bounded copies below are for this log line only — the stored client and
+  // the response below carry the full, untouched values.
+  const MAX_LOGGED_REDIRECT_URIS = 10;
+
+  log.info('register: issued stateless client_id', {
+    redirect_hosts: redirectUris.slice(0, MAX_LOGGED_REDIRECT_URIS).map(redirectHostForLog),
+    application_type: applicationType,
+    scope: truncateForLog(scope),
+    client_name: truncateForLog(body.client_name),
+  });
 
   // RFC 7591 §3.2.1 success response. client_id_issued_at is informational; the
   // registration never expires (no client_secret_expires_at needed for a public
@@ -534,6 +566,16 @@ export async function handleCodeExchange(req: Request): Promise<HandlerResponse>
     });
   }
 
+  // A legacy (untyped) access token has no `state`, so check for it too rather
+  // than fail on it below.
+  if (!isTokenTypeAllowed(decryptedCode as any, [TOKEN_TYPE.code]) || !decryptedCode.state) {
+    return oauthError(400, 'invalid_grant', 'Invalid or expired authorization code', 'token', {
+      reason: 'not an authorization code',
+      typ: (decryptedCode as any).typ,
+      client_id: clientId,
+    });
+  }
+
   const { accessToken, state, identity } = decryptedCode;
 
   if (state.client_id !== clientId || state.redirect_uri !== redirectUri) {
@@ -556,7 +598,7 @@ export async function handleCodeExchange(req: Request): Promise<HandlerResponse>
     return oauthError(400, 'invalid_grant', 'PKCE verification failed', 'token', { client_id: clientId });
   }
 
-  const accessTokenJWE = await createJWE({ accessToken, ...(identity ? { identity } : {}) } satisfies ACCESS_TOKEN_PAYLOAD, '48h');
+  const accessTokenJWE = await createJWE({ typ: TOKEN_TYPE.access, accessToken, ...(identity ? { identity } : {}) } satisfies ACCESS_TOKEN_PAYLOAD, '48h');
 
   // Check if offline_access scope was requested
   const requestedScopes = state.scope ? state.scope.split(' ') : [];
@@ -571,7 +613,7 @@ export async function handleCodeExchange(req: Request): Promise<HandlerResponse>
   // Only include refresh_token if offline_access was requested
   if (hasOfflineAccess) {
     const refreshTokenJWE = await createJWE(
-      { accessToken, type: 'refresh', ...(identity ? { identity } : {}) } satisfies REFRESH_TOKEN_PAYLOAD,
+      { typ: TOKEN_TYPE.refresh, accessToken, type: 'refresh', ...(identity ? { identity } : {}) } satisfies REFRESH_TOKEN_PAYLOAD,
       '7d' // refresh token valid for 7 days
     );
     tokenResponse.refresh_token = refreshTokenJWE;
@@ -617,18 +659,19 @@ async function handleRefreshTokenGrant(bodyParams: URLSearchParams): Promise<Han
     });
   }
 
-  // Validate this is actually a refresh token
-  if (payload.type !== 'refresh') {
-    return oauthError(400, 'invalid_grant', 'Invalid token type', 'token/refresh', { type: payload.type });
+  // Validate this is actually a refresh token. Legacy refresh tokens only have
+  // `type`; new ones have both, so both checks hold for every refresh token.
+  if (payload.type !== 'refresh' || !isTokenTypeAllowed(payload as any, [TOKEN_TYPE.refresh])) {
+    return oauthError(400, 'invalid_grant', 'Invalid token type', 'token/refresh', { type: payload.type, typ: payload.typ });
   }
 
   const { accessToken, identity } = payload;
 
   // Issue new access token and rotate refresh token, carrying identity forward
   // so it survives the token's full refresh lifetime.
-  const newAccessTokenJWE = await createJWE({ accessToken, ...(identity ? { identity } : {}) } satisfies ACCESS_TOKEN_PAYLOAD, '48h');
+  const newAccessTokenJWE = await createJWE({ typ: TOKEN_TYPE.access, accessToken, ...(identity ? { identity } : {}) } satisfies ACCESS_TOKEN_PAYLOAD, '48h');
   const newRefreshTokenJWE = await createJWE(
-    { accessToken, type: 'refresh', ...(identity ? { identity } : {}) } satisfies REFRESH_TOKEN_PAYLOAD,
+    { typ: TOKEN_TYPE.refresh, accessToken, type: 'refresh', ...(identity ? { identity } : {}) } satisfies REFRESH_TOKEN_PAYLOAD,
     '7d'
   );
 

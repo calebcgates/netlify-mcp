@@ -1,5 +1,6 @@
 import { decryptJWE } from "../functions/mcp-server/utils.ts";
-import { log, withLogContext, addLogContext, getRequestId, getDeployId } from "../functions/mcp-server/logger.ts";
+import { isTokenTypeAllowed, TOKEN_TYPE } from "../functions/mcp-server/token-types.ts";
+import { log, withLogContext, addLogContext, getRequestId, getDeployId, truncateForLog } from "../functions/mcp-server/logger.ts";
 import type {Config, Context} from '@netlify/edge-functions';
 
 // Escape regex metacharacters so an allowed-path template is matched literally
@@ -21,7 +22,7 @@ export default async (req: Request, ctx: Context) => {
       requestId: getRequestId(req.headers),
       deployId: getDeployId(req.headers),
       httpMethod: req.method,
-      userAgent: req.headers.get('user-agent') ?? undefined,
+      userAgent: truncateForLog(req.headers.get('user-agent')),
     },
     () => handleProxy(req, token),
   );
@@ -39,7 +40,9 @@ export async function handleProxy(req: Request, token: string): Promise<Response
   } catch {
     return new Response('Unauthorized', { status: 401 });
   }
-  if (!decryptedToken || typeof decryptedToken.accessToken !== 'string') {
+  // Only proxy tokens: an access token would reach the API without the
+  // apisAllowed scope a proxy token carries (see token-types.ts).
+  if (!decryptedToken || typeof decryptedToken.accessToken !== 'string' || !isTokenTypeAllowed(decryptedToken, [TOKEN_TYPE.proxy])) {
     return new Response('Unauthorized', { status: 401 });
   }
 
@@ -58,6 +61,12 @@ export async function handleProxy(req: Request, token: string): Promise<Response
   // substring (e.g. `.../builds/../../../accounts/TEAM/env`) slip past the check
   // and then normalize to an endpoint the token was never scoped to reach.
   const url = new URL(requestedPath as string, 'https://api.netlify.com');
+
+  if (!url.origin.endsWith('.netlify.com')) {
+    log.error('proxy blocked non-Netlify target host', { host: url.host });
+    return new Response('Forbidden', { status: 403 });
+  }
+
   const normalizedPath = url.pathname;
 
   if (Array.isArray(decryptedToken.apisAllowed)) {
@@ -71,7 +80,10 @@ export async function handleProxy(req: Request, token: string): Promise<Response
     });
 
     if (!isAllowed) {
-      log.error('Unauthorized access attempt to path', { normalizedPath, apisAllowed: decryptedToken.apisAllowed });
+      // Expected access-control enforcement (the token requested a path outside
+      // its scope), not a server error — warn so it stays a security signal
+      // without inflating error metrics.
+      log.warn('proxy denied out-of-scope path', { normalizedPath, apisAllowed: decryptedToken.apisAllowed });
       return new Response('Forbidden', { status: 403 });
     }
   }

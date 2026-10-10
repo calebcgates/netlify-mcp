@@ -3,24 +3,32 @@
 // from one web-standard (Request)=>Response handler — replacing v1's
 // StreamableHTTPServerTransport + fetch-to-node bridge.
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
-import { z } from "zod";
 import { addCORSHeadersToFetchResp, returnNeedsAuthResponse } from "./mcp-server/utils.ts";
-import { getContextConsumerConfig, getNetlifyCodingContext } from "../../src/context/coding-context.ts";
+import { registerCodingContextTool } from "../../src/context/register-coding-context-tool.ts";
 import { getPackageVersion } from "../../src/utils/version.ts";
-import { checkCompatibility } from "../../src/utils/compatibility.ts";
 import { bindTools } from "../../src/tools/index.ts";
 import { registerClaudeDesignImportTool } from "../../src/tools/design-import/import-claude-design.ts";
 import { userIsAuthenticated, getTokenIdentity } from "../../src/utils/api-networking.ts";
-import { isClaudeMCPClient } from "../../src/utils/client-detection.ts";
+import { isClaudeMCPClient, isOpenAIMCPClient } from "../../src/utils/client-detection.ts";
 import { maskToken, paramsSummary } from "./mcp-server/logging.ts";
-import { log, withLogContext, addLogContext, getRequestId, initLogger, getDeployId } from "./mcp-server/logger.ts";
+import { log, withLogContext, addLogContext, getRequestId, initLogger, getDeployId, truncateForLog } from "./mcp-server/logger.ts";
 import { withRequestSignals, getAuthChallenge } from "./mcp-server/request-signals.ts";
 import { systemLogForwarder } from "./mcp-server/system-log-forwarder.ts";
-import {Config, Context} from "@netlify/functions";
+import { installProcessGuards } from "./mcp-server/process-guards.ts";
+import { registerEventMethods } from "./mcp-server/events/methods.ts";
+// `import type`, not a value import: these are type-only exports, so a value
+// import survives type-stripping and fails to resolve at load time. Netlify's
+// bundler erases it in a real deploy, which is why this was invisible — but it
+// made this module impossible to import from a test.
+import type { Config, Context } from "@netlify/functions";
 
 // Route structured logs onto Netlify's system-log channel for this Node
 // function. Runs once at cold start; edge/CLI keep the default console forwarder.
 initLogger({ forward: systemLogForwarder });
+
+// Keep detached transient network errors (background keep-alive socket resets)
+// from crashing the function as opaque "Invoke Error"s. Runs once at cold start.
+installProcessGuards();
 
 // Netlify serverless function handler
 export default async (req: Request, context: Context) => {
@@ -36,8 +44,8 @@ export default async (req: Request, context: Context) => {
       requestId: getRequestId(req.headers),
       deployId: getDeployId(context),
       httpMethod: req.method,
-      path: url.pathname,
-      userAgent: req.headers.get('user-agent') ?? undefined,
+      path: truncateForLog(url.pathname),
+      userAgent: truncateForLog(req.headers.get('user-agent')),
       mcpProtocolVersion: req.headers.get('mcp-protocol-version') ?? undefined,
     },
     // Open a request-signals scope around the whole request so tool/API code can
@@ -159,20 +167,44 @@ async function handleMCPPost(req: Request) {
   log.debug('mcp request auth passed');
 
   if (body?.method === 'tools/call') {
-    // Fold both the tool name and the selected operation (the discriminator that
-    // says which action a multiplexing "services" tool actually ran) into the
-    // context so every downstream line — including errors — is attributed to it.
-    const operation = body?.params?.arguments?.selectSchema?.operation;
+    // Standalone tools (coding-context, design import) have no selectSchema.operation;
+    // fall back to the tool name so every call has one `operation` dimension for tracking.
+    const toolName = body?.params?.name;
+    const selectedOperation = body?.params?.arguments?.selectSchema?.operation;
+    const operation = typeof selectedOperation === 'string' ? selectedOperation : toolName;
     addLogContext({
-      toolName: body?.params?.name,
+      toolName,
       ...(typeof operation === 'string' ? { operation } : {}),
     });
     log.info('tool call', paramsSummary(body?.params));
   } else if (body?.method === 'tools/list') {
     log.info('tools list requested');
+  } else if (typeof body?.method === 'string' && body.method.startsWith('events/')) {
+    // Event names and the site argument are safe shape; the callback URL and
+    // signing secret in delivery are NOT and are never logged.
+    addLogContext({ eventName: body?.params?.name });
+    log.info('events request', {
+      method: body.method,
+      deliveryMode: body?.params?.delivery?.mode,
+      argumentNames: body?.params?.arguments && typeof body.params.arguments === 'object'
+        ? Object.keys(body.params.arguments)
+        : undefined,
+    });
   }
 
-  const verboseMode = new URL(req.url).searchParams.get('verbose') === 'true';
+  // Granular mode registers one tool per operation instead of a per-domain
+  // selector tool. `?verbose=true` opts in manually; OpenAI's client always
+  // gets it, because their app guidelines require each model-callable operation
+  // to be individually exposed for review (see isOpenAIMCPClient).
+  const explicitlyVerbose = new URL(req.url).searchParams.get('verbose') === 'true';
+  const openAIClient = isOpenAIMCPClient(req);
+  const verboseMode = explicitlyVerbose || openAIClient;
+  if (verboseMode) {
+    addLogContext({
+      toolSurface: 'granular',
+      granularReason: openAIClient ? 'openai-client' : 'verbose-param',
+    });
+  }
 
   // Reconstruct a request with the buffered body so the v2 handler can read it
   // (req's stream was consumed above).
@@ -190,36 +222,25 @@ async function handleMCPPost(req: Request) {
     async () => {
       const server = new McpServer({ name: "netlify", version: getPackageVersion() });
 
-      const contextConsumer = await getContextConsumerConfig();
-      const availableContextTypes = Object.keys(contextConsumer?.contextScopes || {});
-
-      // Only register the coding-context tool when we actually have scopes to
-      // offer. With no scopes (e.g. the consumer config failed to fetch at cold
-      // start), z.enum([]) yields an uncallable tool — its required creationType
-      // can satisfy no value — so skip it until scopes become available. Normal
-      // enum construction proceeds whenever at least one scope exists.
-      if (availableContextTypes.length > 0) {
-        const creationTypeEnum = z.enum(availableContextTypes as [string, ...string[]]);
-
-        server.registerTool(
-          "get-netlify-coding-context",
-          {
-            description:
-              "ALWAYS call when writing code. Required step before creating or editing any type of functions, Netlify sdk/library usage, etc. Use other operations for project management.",
-            inputSchema: { creationType: creationTypeEnum },
-            annotations: { readOnlyHint: true },
-          },
-          async ({ creationType }) => {
-            checkCompatibility();
-            const context = await getNetlifyCodingContext(creationType);
-            return { content: [{ type: "text" as const, text: context?.content || "" }] };
-          },
-        );
-      }
+      await registerCodingContextTool(server, {
+        name: "get-netlify-coding-context",
+        description:
+          "ALWAYS call when writing code. Required step before creating or editing any type of functions, Netlify sdk/library usage, etc. Use other operations for project management.",
+      });
 
       // Claude-only top-level design-import tool (detected from the request/body).
       if (isClaudeMCPClient(req, body)) {
         registerClaudeDesignImportTool(server, req);
+      }
+
+      // The events extension (events/list | subscribe | unsubscribe). Not MCP
+      // spec — see events/methods.ts. Registered for every client: clients that
+      // don't know the vocabulary simply never call it, and the advertised
+      // `events` capability is inert to them.
+      try {
+        registerEventMethods(server, req);
+      } catch (error) {
+        log.error('Failed to register event methods', { err: error });
       }
 
       // All Netlify domain tools. A failure here shouldn't sink the whole request

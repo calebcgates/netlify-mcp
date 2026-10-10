@@ -14,7 +14,10 @@ import {
 } from '../../utils/api-networking.js';
 import { zipAndBuild } from '../deploy-tools/deploy-site.js';
 import { appendErrorToLog } from '../../utils/logging.js';
-import { deployIdFromJob, fallbackImportSiteName, importSiteName, matchTeam, projectMarker, type TeamRef } from './job-utils.js';
+import { log } from '../../../netlify/functions/mcp-server/logger.js';
+import { deployIdFromJob, fallbackImportSiteName, importSiteName, matchTeam, projectMarker } from './job-utils.js';
+import { ALLOWED_DESIGN_HOSTS_DESCRIPTION, isAllowedDesignHost } from './url-guard.js';
+import type { NetlifyAccountResponse, NetlifyDeployResponse } from '../../utils/api-types.js';
 
 
 // Claude Design discovers export destinations by this literal tool name.
@@ -79,7 +82,7 @@ export async function runClaudeDesignImport(
   { url, title, account_slug, password, claude_design_project_id: projectId }: ImportInput,
   request?: Request,
 ): Promise<ImportResult> {
-  const html = await fetchDesignHtml(url);
+  const html = await fetchDesignHtml(url, projectId);
 
   const existingSite = projectId ? await findSiteForProject(projectId, request) : undefined;
 
@@ -116,14 +119,14 @@ export async function getClaudeDesignImportStatus(
   request?: Request,
 ): Promise<StatusResult> {
   const deployId = deployIdFromJob(jobId);
-  const deploy = await getAPIJSONResult(`/api/v1/deploys/${deployId}`, {}, {}, request);
+  const deploy = await getAPIJSONResult<NetlifyDeployResponse>(`/api/v1/deploys/${deployId}`, {}, {}, request);
   const state: string = deploy?.state || 'unknown';
   const status =
     state === 'ready' ? 'done' : state === 'error' || state === 'rejected' ? 'failed' : 'processing';
   return { status, design_url: status === 'done' ? deploy?.ssl_url || deploy?.url : undefined, state };
 }
 
-async function fetchDesignHtml(url: string): Promise<string> {
+async function fetchDesignHtml(url: string, projectId?: string): Promise<string> {
   let target: URL;
   try {
     target = new URL(url);
@@ -132,6 +135,27 @@ async function fetchDesignHtml(url: string): Promise<string> {
   }
   if (target.protocol !== 'https:') {
     throw new Error('url must be an https URL');
+  }
+
+  // Only Claude Design's own hosts are valid sources; this confines the
+  // server-side fetch and prevents it from being pointed at any other host (SSRF).
+  //
+  // Two different audiences get two different amounts of detail:
+  //  - The thrown message reaches the calling agent and may get echoed back into
+  //    a conversation, so it carries only the origin (scheme+host[+port]) — never
+  //    the full URL, since a real signed URL's signature lives in its query string.
+  //  - The log line is operator-only (Netlify function logs), so it's safe to
+  //    include the full URL plus the Claude Design project id (when this came
+  //    from a re-send with claude_design_project_id set) — enough to trace which
+  //    project on Anthropic's side triggered it, in case Claude Design starts
+  //    serving exports from a new host and the allow-list needs updating.
+  if (!isAllowedDesignHost(target.hostname)) {
+    log.error('design import blocked: url host not on allow-list', {
+      host: target.hostname,
+      url: target.href,
+      claudeDesignProjectId: projectId,
+    });
+    throw new Error(`url must be a Claude Design URL (${ALLOWED_DESIGN_HOSTS_DESCRIPTION}); got ${target.origin}`);
   }
 
   const controller = new AbortController();
@@ -213,9 +237,9 @@ async function resolveTeamSlug(
   requested: string,
   request?: Request,
 ): Promise<{ slug?: string; note?: string }> {
-  let teams: TeamRef[];
+  let teams: NetlifyAccountResponse[];
   try {
-    teams = (await getAPIJSONResult('/api/v1/accounts', {}, {}, request)) as TeamRef[];
+    teams = await getAPIJSONResult<NetlifyAccountResponse[]>('/api/v1/accounts', {}, {}, request);
   } catch {
     // Can't list teams — pass the hint through; the create-time fallback catches
     // an unusable team.
@@ -354,7 +378,7 @@ export function registerClaudeDesignImportTool(server: McpServer, remoteMCPReque
       description:
         'Deploy a Claude Design design to Netlify. This is the "Send to Netlify" destination for Claude Design: it takes a publicly fetchable URL to a self-contained HTML bundle (images, fonts, and styles inlined), creates a Netlify site, deploys the HTML, and returns a live URL. Intended for Claude Design exports, not general-purpose web hosting.',
       inputSchema: importInputSchema,
-      annotations: { readOnlyHint: false, destructiveHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async (input: ImportInput) => {
       const authError = await guardAuth(remoteMCPRequest);
@@ -374,6 +398,9 @@ export function registerClaudeDesignImportTool(server: McpServer, remoteMCPReque
         return { content: [{ type: 'text' as const, text }] };
       } catch (error: any) {
         appendErrorToLog(`${IMPORT_TOOL_NAME} failed: ${error}`);
+        if (!(error instanceof NetlifyUnauthError)) {
+          log.error('tool operation failed', { operation: IMPORT_TOOL_NAME, toolName: IMPORT_TOOL_NAME, err: error });
+        }
         return {
           content: [{ type: 'text' as const, text: `Failed to import design: ${error?.message || error}` }],
           isError: true,
@@ -388,7 +415,7 @@ export function registerClaudeDesignImportTool(server: McpServer, remoteMCPReque
       description:
         'Check the status of a Claude Design import started by import-claude-design-from-url. Returns processing | done | failed, plus the design URL once done.',
       inputSchema: statusInputSchema,
-      annotations: { readOnlyHint: true, destructiveHint: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async ({ job_id }: { job_id: string }) => {
       const authError = await guardAuth(remoteMCPRequest);
@@ -398,6 +425,9 @@ export function registerClaudeDesignImportTool(server: McpServer, remoteMCPReque
         const result = await getClaudeDesignImportStatus(job_id, remoteMCPRequest);
         return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
       } catch (error: any) {
+        if (!(error instanceof NetlifyUnauthError)) {
+          log.error('tool operation failed', { operation: STATUS_TOOL_NAME, toolName: STATUS_TOOL_NAME, err: error });
+        }
         return {
           content: [{ type: 'text' as const, text: `Failed to get import status: ${error?.message || error}` }],
           isError: true,
